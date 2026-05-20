@@ -1,14 +1,14 @@
 # Deploy
 
 1. Point DNS records:
-   - `one2one.dev.gloud.com.ua` to the server running Traefik.
+   - `p2pcall.dev.gloud.com.ua` to the server running Traefik.
    - `turn.dev.gloud.com.ua` to the same server public IP.
 
 2. Create `.env`:
 
 ```env
 TURN_EXTERNAL_IP=YOUR_SERVER_PUBLIC_IP
-TURN_USERNAME=one2one
+TURN_USERNAME=p2pcall
 TURN_CREDENTIAL=CHANGE_ME_LONG_RANDOM_SECRET
 ```
 
