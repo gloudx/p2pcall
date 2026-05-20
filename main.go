@@ -88,7 +88,12 @@ func loadConfig() Config {
 
 	if config.BaseURL != "" {
 		if parsed, err := url.Parse(config.BaseURL); err == nil && parsed.Host != "" {
-			config.OriginPatterns = append(config.OriginPatterns, parsed.Scheme+"://"+parsed.Host)
+			config.OriginPatterns = append(config.OriginPatterns,
+				parsed.Host,
+				parsed.Host+":*",
+				parsed.Scheme+"://"+parsed.Host,
+				parsed.Scheme+"://"+parsed.Host+":*",
+			)
 		}
 	}
 
@@ -317,5 +322,6 @@ func main() {
 	if config.BaseURL != "" {
 		log.Println("public URL:", config.BaseURL)
 	}
+	log.Println("websocket origin patterns:", strings.Join(config.OriginPatterns, ", "))
 	log.Fatal(http.ListenAndServe("0.0.0.0:"+config.Port, nil))
 }
