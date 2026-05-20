@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="ru">
+
+<head>
+    <meta charset="utf-8" />
+    <title>P2P Call</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            background: #111;
+            color: white;
+            margin: 0;
+            padding: 24px;
+        }
+
+        .videos {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-top: 24px;
+        }
+
+        video {
+            width: 100%;
+            background: #000;
+            border-radius: 16px;
+        }
+
+        button,
+        input {
+            padding: 12px 16px;
+            border-radius: 10px;
+            border: none;
+            margin: 4px;
+        }
+
+        button {
+            cursor: pointer;
+            background: #4f46e5;
+            color: white;
+        }
+
+        input {
+            width: 70%;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Простой P2P звонок</h1>
+
+    <button onclick="createRoom()">Создать комнату</button>
+    <button onclick="startCall()">Начать звонок</button>
+    <button onclick="hangup()">Завершить</button>
+
+    <p>
+        Ссылка комнаты:
+    </p>
+
+    <input id="roomLink" readonly />
+    <p id="status">Статус: ожидание</p>
+
+    <div class="videos">
+        <video id="localVideo" autoplay muted playsinline></video>
+        <video id="remoteVideo" autoplay playsinline controls></video>
+    </div>
+
+    <script>
+        const params = new URLSearchParams(location.search);
+
+        let appConfig = {
+            baseUrl: "",
+            iceServers: [
+                { urls: "stun:stun.l.google.com:19302" },
+                { urls: "stun:global.stun.twilio.com:3478" }
+            ]
+        };
+
+        let room = params.get("room");
+        let token = params.get("token");
+
+        let ws;
+        let pc;
+        let localStream;
+        let remoteStream;
+        let pendingIceCandidates = [];
+        let callRequested = false;
+        let makingOffer = false;
+        let ignoreOffer = false;
+
+        const localVideo = document.getElementById("localVideo");
+        const remoteVideo = document.getElementById("remoteVideo");
+        const roomLink = document.getElementById("roomLink");
+        const statusEl = document.getElementById("status");
+
+        init();
+
+        async function init() {
+            await loadConfig();
+
+            if (room && token) {
+                roomLink.value = publicUrl(location.pathname + location.search);
+                connectWS();
+            }
+        }
+
+        async function loadConfig() {
+            try {
+                const res = await fetch("/api/config");
+                appConfig = await res.json();
+            } catch (err) {
+                console.warn("config load failed, using browser origin", err);
+            }
+        }
+
+        async function createRoom() {
+            const res = await fetch("/api/room");
+            const data = await res.json();
+
+            const url = publicUrl(data.url + "&join=1");
+            roomLink.value = url;
+
+            history.pushState(null, "", data.url);
+
+            room = data.room;
+            token = data.token;
+
+            connectWS();
+        }
+
+        function publicUrl(path) {
+            return (appConfig.baseUrl || location.origin) + path;
+        }
+
+        function connectWS() {
+            const proto = location.protocol === "https:" ? "wss" : "ws";
+            ws = new WebSocket(`${proto}://${location.host}/ws?room=${room}&token=${token}`);
+
+            ws.onopen = () => {
+                console.log("ws connected");
+                setStatus("WebSocket подключен");
+            };
+
+            ws.onerror = (event) => {
+                console.error("ws error", event);
+            };
+
+            ws.onclose = (event) => {
+                console.log("ws closed", event.code, event.reason);
+                setStatus(`WebSocket закрыт: ${event.code}`);
+            };
+
+            ws.onmessage = async (event) => {
+                const msg = JSON.parse(event.data);
+
+                if (msg.type === "peer-joined") {
+                    console.log("peer joined");
+
+                    if (callRequested) {
+                        await preparePeerConnection();
+                        await sendOffer();
+                    }
+
+                    return;
+                }
+
+                if (msg.type === "offer") {
+                    await preparePeerConnection();
+
+                    const offerCollision = makingOffer || pc.signalingState !== "stable";
+                    ignoreOffer = offerCollision && !isPolitePeer();
+
+                    if (ignoreOffer) {
+                        console.log("ignored colliding offer");
+                        return;
+                    }
+
+                    await pc.setRemoteDescription(msg.data);
+                    await flushPendingIceCandidates();
+
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+
+                    sendSignal("answer", answer);
+                }
+
+                if (msg.type === "answer") {
+                    if (!pc) {
+                        console.warn("answer received before peer connection");
+                        return;
+                    }
+
+                    await pc.setRemoteDescription(msg.data);
+                    await flushPendingIceCandidates();
+                }
+
+                if (msg.type === "ice") {
+                    await addIceCandidate(msg.data);
+                }
+            };
+        }
+
+        async function preparePeerConnection() {
+            if (pc) {
+                return pc;
+            }
+
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                alert("Камера и микрофон работают только через HTTPS. Открой сайт через ngrok-ссылку с https://");
+                throw new Error("getUserMedia requires HTTPS");
+            }
+
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: true,
+                    audio: true
+                });
+            } catch (err) {
+                console.error("getUserMedia failed", err);
+                alert("Не удалось получить камеру/микрофон. Проверь разрешения браузера.");
+                throw err;
+            }
+
+            localVideo.srcObject = localStream;
+            await localVideo.play().catch(() => { });
+
+            remoteStream = new MediaStream();
+            remoteVideo.srcObject = remoteStream;
+
+            pc = new RTCPeerConnection({
+                iceServers: appConfig.iceServers
+            });
+
+            localStream.getTracks().forEach(track => {
+                console.log("local track", track.kind, track.id);
+                pc.addTrack(track, localStream);
+            });
+
+            pc.ontrack = (event) => {
+                console.log("remote track received", event.track.kind, event.track.id);
+                remoteStream.addTrack(event.track);
+                setStatus(`Получен remote ${event.track.kind}, ICE: ${pc.iceConnectionState}`);
+                remoteVideo.play().catch((err) => {
+                    console.error("remote video play failed", err);
+                    setStatus("Remote поток получен, но браузер заблокировал autoplay. Нажми play на правом видео.");
+                });
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    console.log("local ice candidate", event.candidate.type, event.candidate.protocol);
+                    sendSignal("ice", event.candidate);
+                }
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                console.log("ice state", pc.iceConnectionState);
+                setStatus(`ICE: ${pc.iceConnectionState}`);
+            };
+
+            pc.onconnectionstatechange = () => {
+                console.log("connection state", pc.connectionState);
+                setStatus(`Соединение: ${pc.connectionState}, ICE: ${pc.iceConnectionState}`);
+            };
+
+            return pc;
+        }
+
+        async function startCall() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert("Сначала создай или открой комнату");
+                return;
+            }
+
+            try {
+                await preparePeerConnection();
+            } catch {
+                return;
+            }
+
+            callRequested = true;
+            await sendOffer();
+        }
+
+        async function sendOffer() {
+            try {
+                makingOffer = true;
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+            } finally {
+                makingOffer = false;
+            }
+
+            sendSignal("offer", pc.localDescription);
+        }
+
+        function sendSignal(type, data) {
+            ws.send(JSON.stringify({
+                type,
+                room,
+                token,
+                data
+            }));
+        }
+
+        async function addIceCandidate(candidate) {
+            if (!pc || !pc.remoteDescription) {
+                pendingIceCandidates.push(candidate);
+                return;
+            }
+
+            try {
+                await pc.addIceCandidate(candidate);
+            } catch (err) {
+                if (!ignoreOffer) {
+                    console.error("addIceCandidate failed", err);
+                }
+            }
+        }
+
+        function isPolitePeer() {
+            return new URLSearchParams(location.search).has("join");
+        }
+
+        function setStatus(text) {
+            statusEl.textContent = `Статус: ${text}`;
+        }
+
+        async function flushPendingIceCandidates() {
+            const candidates = pendingIceCandidates;
+            pendingIceCandidates = [];
+
+            for (const candidate of candidates) {
+                await addIceCandidate(candidate);
+            }
+        }
+
+        function hangup() {
+            callRequested = false;
+            pendingIceCandidates = [];
+
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+
+            if (remoteStream) {
+                remoteStream.getTracks().forEach(track => track.stop());
+                remoteStream = null;
+            }
+
+            localVideo.srcObject = null;
+            remoteVideo.srcObject = null;
+        }
+    </script>
+</body>
+
+</html>

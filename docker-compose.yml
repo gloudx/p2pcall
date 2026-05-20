@@ -1,0 +1,59 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV: production
+      APP_PORT: "3000"
+      APP_BASE_URL: "https://p2pcall.dev.gloud.com.ua"
+      TURN_URL: "turn:turn.dev.gloud.com.ua:3478"
+      TURN_USERNAME: "${TURN_USERNAME}"
+      TURN_CREDENTIAL: "${TURN_CREDENTIAL}"
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      - coturn
+    networks:
+      - internal
+      - devbox
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.p2pcall.rule=Host(`p2pcall.dev.gloud.com.ua`)"
+      - "traefik.http.routers.p2pcall.entrypoints=web"
+      - "traefik.http.services.p2pcall.loadbalancer.server.port=3000"
+
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - path: .env
+        required: false
+    command:
+      - -n
+      - --listening-port=3478
+      - --tls-listening-port=5349
+      - --realm=turn.dev.gloud.com.ua
+      - --server-name=turn.dev.gloud.com.ua
+      - --external-ip=${TURN_EXTERNAL_IP}
+      - --user=${TURN_USERNAME}:${TURN_CREDENTIAL}
+      - --lt-cred-mech
+      - --fingerprint
+      - --no-multicast-peers
+      - --min-port=49152
+      - --max-port=65535
+      - --log-file=stdout
+
+volumes:
+  app_data:
+
+networks:
+  internal:
+    driver: bridge
+  devbox:
+    external: true

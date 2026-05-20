@@ -1,0 +1,9 @@
+.git
+.env
+Dockerfile
+docker-compose*.yml
+p2pcall
+tmp
+dist
+coverage.out
+node_modules
