@@ -598,6 +598,7 @@
             try {
                 const res = await fetch("/api/config");
                 appConfig = await res.json();
+                console.log("[p2pcall] ice servers", appConfig.iceServers);
             } catch (err) {
                 console.warn("config load failed, using browser origin", err);
             }
@@ -645,7 +646,7 @@
             }
 
             callRequested = true;
-            if (ws.readyState === WebSocket.OPEN) {
+            if (!isPolitePeer() && ws.readyState === WebSocket.OPEN) {
                 await sendOffer();
             }
         }
@@ -660,8 +661,8 @@
 
             ws.onopen = async () => {
                 debug("WebSocket opened");
-                setStatus("Ожидание собеседника");
-                if (callRequested && pc) {
+                setStatus(isPolitePeer() ? "Ожидание приглашения" : "Ожидание собеседника");
+                if (!isPolitePeer() && callRequested && pc) {
                     await sendOffer();
                 }
             };
@@ -682,7 +683,7 @@
                 if (msg.type === "peer-joined") {
                     debug("peer joined");
 
-                    if (callRequested) {
+                    if (!isPolitePeer() && callRequested) {
                         await preparePeerConnection();
                         await sendOffer();
                     }
@@ -691,6 +692,7 @@
                 }
 
                 if (msg.type === "offer") {
+                    debug("offer received");
                     await preparePeerConnection();
 
                     const offerCollision = makingOffer || pc.signalingState !== "stable";
@@ -708,9 +710,11 @@
                     await pc.setLocalDescription(answer);
 
                     sendSignal("answer", answer);
+                    setStatus("Ответ отправлен");
                 }
 
                 if (msg.type === "answer") {
+                    debug("answer received");
                     if (!pc) {
                         console.warn("answer received before peer connection");
                         return;
