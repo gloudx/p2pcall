@@ -206,11 +206,18 @@ func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
 		send: make(chan []byte, 32),
 	}
 
+	hadPeer := len(room.clients) > 0
 	room.clients[client] = true
 	s.mu.Unlock()
 
 	log.Println("client joined room:", roomID)
 	s.broadcastToOther(roomID, client, []byte(`{"type":"peer-joined"}`))
+	if hadPeer {
+		select {
+		case client.send <- []byte(`{"type":"peer-joined"}`):
+		default:
+		}
+	}
 
 	go s.writeLoop(r.Context(), client)
 

@@ -534,6 +534,7 @@
         <div id="call-debug"></div>
     </section>
 
+    <script src="/simplepeer.min.js"></script>
     <script>
         const params = new URLSearchParams(location.search);
 
@@ -549,13 +550,10 @@
         let token = params.get("token");
 
         let ws;
-        let pc;
+        let peer;
         let localStream;
-        let remoteStream;
-        let pendingIceCandidates = [];
+        let localStreamPromise;
         let callRequested = false;
-        let makingOffer = false;
-        let ignoreOffer = false;
 
         const homePanel = document.getElementById("homePanel");
         const invitePanel = document.getElementById("invitePanel");
@@ -637,17 +635,13 @@
             document.body.classList.add("in-room");
             roomView.dataset.debug = new URLSearchParams(location.search).has("debug") ? "true" : "false";
             setStatus("Подготовка камеры");
+            callRequested = true;
             connectWS();
 
             try {
                 await preparePeerConnection();
             } catch {
                 return;
-            }
-
-            callRequested = true;
-            if (!isPolitePeer() && ws.readyState === WebSocket.OPEN) {
-                await sendOffer();
             }
         }
 
@@ -662,9 +656,6 @@
             ws.onopen = async () => {
                 debug("WebSocket opened");
                 setStatus(isPolitePeer() ? "Ожидание приглашения" : "Ожидание собеседника");
-                if (!isPolitePeer() && callRequested && pc) {
-                    await sendOffer();
-                }
             };
 
             ws.onerror = (event) => {
@@ -685,54 +676,32 @@
 
                     if (!isPolitePeer() && callRequested) {
                         await preparePeerConnection();
-                        await sendOffer();
+                        setupPeer(true);
                     }
 
                     return;
                 }
 
-                if (msg.type === "offer") {
-                    debug("offer received");
+                if (msg.type === "signal") {
+                    debug(`signal received: ${msg.data.type || "candidate"}`);
                     await preparePeerConnection();
 
-                    const offerCollision = makingOffer || pc.signalingState !== "stable";
-                    ignoreOffer = offerCollision && !isPolitePeer();
-
-                    if (ignoreOffer) {
-                        debug("ignored colliding offer");
-                        return;
+                    if (!peer || peer.destroyed) {
+                        setupPeer(false);
                     }
 
-                    await pc.setRemoteDescription(msg.data);
-                    await flushPendingIceCandidates();
-
-                    const answer = await pc.createAnswer();
-                    await pc.setLocalDescription(answer);
-
-                    sendSignal("answer", answer);
-                    setStatus("Ответ отправлен");
-                }
-
-                if (msg.type === "answer") {
-                    debug("answer received");
-                    if (!pc) {
-                        console.warn("answer received before peer connection");
-                        return;
-                    }
-
-                    await pc.setRemoteDescription(msg.data);
-                    await flushPendingIceCandidates();
-                }
-
-                if (msg.type === "ice") {
-                    await addIceCandidate(msg.data);
+                    peer.signal(msg.data);
                 }
             };
         }
 
         async function preparePeerConnection() {
-            if (pc) {
-                return pc;
+            if (localStream) {
+                return localStream;
+            }
+
+            if (localStreamPromise) {
+                return localStreamPromise;
             }
 
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -740,81 +709,89 @@
                 throw new Error("getUserMedia requires HTTPS");
             }
 
-            try {
+            localStreamPromise = (async () => {
                 localStream = await navigator.mediaDevices.getUserMedia({
                     video: true,
                     audio: true
                 });
+
+                localVideo.srcObject = localStream;
+                await localVideo.play().catch(() => { });
+
+                return localStream;
+            })();
+
+            try {
+                return await localStreamPromise;
             } catch (err) {
+                localStreamPromise = null;
                 console.error("getUserMedia failed", err);
                 setStatus("Камера или микрофон недоступны");
                 throw err;
             }
+        }
 
-            localVideo.srcObject = localStream;
-            await localVideo.play().catch(() => { });
+        function setupPeer(initiator) {
+            if (peer && !peer.destroyed) {
+                return peer;
+            }
 
-            remoteStream = new MediaStream();
-            remoteVideo.srcObject = remoteStream;
+            debug(`setup peer: ${initiator ? "initiator" : "receiver"}`);
+            setStatus("Соединение");
 
-            pc = new RTCPeerConnection({
-                iceServers: appConfig.iceServers
+            peer = new SimplePeer({
+                initiator,
+                stream: localStream,
+                config: {
+                    iceServers: appConfig.iceServers
+                },
+                trickle: true
             });
 
-            localStream.getTracks().forEach(track => {
-                debug(`local track: ${track.kind}`);
-                pc.addTrack(track, localStream);
+            peer.on("signal", (data) => {
+                debug(`signal sent: ${data.type || "candidate"}`);
+                sendSignal("signal", data);
             });
 
-            pc.ontrack = (event) => {
-                debug(`remote track: ${event.track.kind}`);
-                remoteStream.addTrack(event.track);
+            peer.on("stream", (stream) => {
+                debug("remote stream received");
+                remoteVideo.srcObject = stream;
                 waitingEl.style.display = "none";
                 setStatus("В звонке");
                 remoteVideo.play().catch((err) => {
                     console.error("remote video play failed", err);
                     setStatus("Нажмите play на видео");
                 });
-            };
+            });
 
-            pc.onicecandidate = (event) => {
-                if (event.candidate) {
-                    debug(`ICE candidate: ${event.candidate.type || "candidate"}`);
-                    sendSignal("ice", event.candidate);
-                }
-            };
+            peer.on("connect", () => {
+                debug("peer connected");
+                setStatus("В звонке");
+            });
 
-            pc.oniceconnectionstatechange = () => {
-                debug(`ICE: ${pc.iceConnectionState}`);
-                if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+            peer.on("iceStateChange", (state) => {
+                debug(`ICE: ${state}`);
+                if (state === "connected" || state === "completed") {
                     setStatus("В звонке");
-                } else if (pc.iceConnectionState === "failed") {
+                } else if (state === "failed") {
                     setStatus("ICE failed");
                 } else {
-                    setStatus(`ICE: ${pc.iceConnectionState}`);
+                    setStatus(`ICE: ${state}`);
                 }
-            };
+            });
 
-            pc.onconnectionstatechange = () => {
-                debug(`connection: ${pc.connectionState}`);
-                if (pc.connectionState === "connected") {
-                    setStatus("В звонке");
-                }
-            };
+            peer.on("error", (err) => {
+                console.error("peer error", err);
+                debug(`peer error: ${err.message}`);
+                setStatus("Ошибка WebRTC");
+            });
 
-            return pc;
-        }
+            peer.on("close", () => {
+                debug("peer closed");
+                peer = null;
+            });
 
-        async function sendOffer() {
-            try {
-                makingOffer = true;
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-            } finally {
-                makingOffer = false;
-            }
-
-            sendSignal("offer", pc.localDescription);
+            return peer;
         }
 
         function sendSignal(type, data) {
@@ -828,21 +805,6 @@
             }));
         }
 
-        async function addIceCandidate(candidate) {
-            if (!pc || !pc.remoteDescription) {
-                pendingIceCandidates.push(candidate);
-                return;
-            }
-
-            try {
-                await pc.addIceCandidate(candidate);
-            } catch (err) {
-                if (!ignoreOffer) {
-                    console.error("addIceCandidate failed", err);
-                }
-            }
-        }
-
         function isPolitePeer() {
             return new URLSearchParams(location.search).has("join");
         }
@@ -854,15 +816,6 @@
         function debug(text) {
             console.log(`[p2pcall] ${text}`);
             debugEl.textContent = text;
-        }
-
-        async function flushPendingIceCandidates() {
-            const candidates = pendingIceCandidates;
-            pendingIceCandidates = [];
-
-            for (const candidate of candidates) {
-                await addIceCandidate(candidate);
-            }
         }
 
         function toggleMic() {
@@ -885,11 +838,10 @@
 
         function hangup() {
             callRequested = false;
-            pendingIceCandidates = [];
 
-            if (pc) {
-                pc.close();
-                pc = null;
+            if (peer) {
+                peer.destroy();
+                peer = null;
             }
 
             if (ws) {
@@ -901,11 +853,7 @@
                 localStream.getTracks().forEach(track => track.stop());
                 localStream = null;
             }
-
-            if (remoteStream) {
-                remoteStream.getTracks().forEach(track => track.stop());
-                remoteStream = null;
-            }
+            localStreamPromise = null;
 
             localVideo.srcObject = null;
             remoteVideo.srcObject = null;
