@@ -23,12 +23,9 @@ services:
       - devbox
     labels:
       - "traefik.enable=true"
-      - "traefik.docker.network=devbox"
       - "traefik.http.routers.p2pcall.rule=Host(`p2pcall.dev.gloud.com.ua`)"
-      - "traefik.http.routers.p2pcall.entrypoints=websecure"
-      - "traefik.http.routers.p2pcall.tls=true"
+      - "traefik.http.routers.p2pcall.entrypoints=web"
       - "traefik.http.services.p2pcall.loadbalancer.server.port=3000"
-
   coturn:
     image: coturn/coturn:latest
     restart: unless-stopped
